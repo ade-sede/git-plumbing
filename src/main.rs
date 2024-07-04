@@ -1,12 +1,14 @@
 #[allow(unused_imports)]
 use std::env;
 use std::{
-    fs::File,
-    io::{BufRead, BufReader, Read},
+    fs::{DirBuilder, File},
+    io::{BufRead, BufReader, Read, Write},
 };
 
+use sha1::{Digest, Sha1};
+
 use clap::{Parser, Subcommand};
-use flate2::read::ZlibDecoder;
+use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -23,6 +25,11 @@ enum Command {
         pretty_print: bool,
 
         object_hash: String,
+    },
+    HashObject {
+        #[clap(short = 'w')]
+        write: bool,
+        filename: String,
     },
 }
 
@@ -58,12 +65,12 @@ fn main() -> std::io::Result<()> {
             if let Ok(file) = File::open(&path) {
                 let mut buf = Vec::new();
 
-                let decompressor = ZlibDecoder::new(file);
-                let mut decompressor = BufReader::new(decompressor);
+                let decoder = ZlibDecoder::new(file);
+                let mut decoder = BufReader::new(decoder);
 
                 // `<blob|commit|tag|tree> <size>\0<content>`
                 // Note: delimiter is captured
-                decompressor.read_until(0, &mut buf).unwrap();
+                decoder.read_until(0, &mut buf).unwrap();
 
                 let metadata = &buf[0..buf.len() - 1];
                 let mut iter = metadata.split(|&x| x == b' ');
@@ -83,7 +90,7 @@ fn main() -> std::io::Result<()> {
                 }
 
                 buf.clear();
-                decompressor.read_to_end(&mut buf).unwrap();
+                decoder.read_to_end(&mut buf).unwrap();
 
                 let content = String::from_utf8(buf).unwrap();
                 print!("{}", content);
@@ -91,6 +98,51 @@ fn main() -> std::io::Result<()> {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     std::format!("No such file or directory: {}", &path),
+                ));
+            }
+        }
+        Command::HashObject { write, filename } => {
+            if let Ok(input_file) = File::open(&filename) {
+                let mut content = Vec::new();
+                let mut reader = BufReader::new(input_file);
+                reader.read_to_end(&mut content).unwrap();
+
+                let mut hasher = Sha1::new();
+                hasher.write_all(b"blob ").unwrap();
+                hasher
+                    .write_all(content.len().to_string().as_bytes())
+                    .unwrap();
+                hasher.write_all(b"\0").unwrap();
+                hasher.write_all(content.as_slice()).unwrap();
+                let sha = hasher.finalize();
+                let sha = format!("{:x}", sha);
+
+                let dirname = &sha[0..2];
+                let filename = &sha[2..];
+
+                if write {
+                    DirBuilder::new()
+                        .create(format!(".git/objects/{dirname}"))
+                        .unwrap();
+
+                    let output_file =
+                        File::create(format!(".git/objects/{dirname}/{filename}")).unwrap();
+
+                    let mut encoder = ZlibEncoder::new(output_file, Compression::best());
+
+                    encoder.write_all(b"blob ").unwrap();
+                    encoder
+                        .write_all(content.len().to_string().as_bytes())
+                        .unwrap();
+                    encoder.write_all(b"\0").unwrap();
+                    encoder.write_all(content.as_slice()).unwrap();
+                }
+
+                println!("{}", sha);
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    std::format!("No such file or directory: {}", &filename),
                 ));
             }
         }
