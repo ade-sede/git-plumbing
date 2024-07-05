@@ -226,7 +226,7 @@ fn main() -> Result<(), anyhow::Error> {
                 hasher.write_all(&object)?;
 
                 let sha = hasher.finalize();
-                let object_hash = format!("{:x}", sha);
+                let object_hash = hex::encode(sha);
 
                 let dirname = &object_hash[0..2];
                 let filename = &object_hash[2..];
