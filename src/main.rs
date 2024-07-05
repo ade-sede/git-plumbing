@@ -3,6 +3,7 @@ use std::env;
 use std::{
     fs::File,
     io::{BufRead, BufReader, Read, Write},
+    str::FromStr,
 };
 
 use anyhow::{anyhow, Context};
@@ -32,6 +33,11 @@ enum Command {
         write: bool,
         filename: String,
     },
+    LsTree {
+        #[clap(long)]
+        name_only: bool,
+        object_hash: String,
+    },
 }
 
 #[allow(unused_imports)]
@@ -40,49 +46,125 @@ use std::fs;
 #[derive(Eq, PartialEq)]
 enum ObjectType {
     Blob,
+    Tree,
 }
 
-struct GitObject {
-    object_type: ObjectType,
-    _size: usize,
+struct BlobObject {
+    _data_size: usize,
     data: Vec<u8>,
 }
 
-// `<blob> <size>\0<content>`.
-fn parse_git_object(mut reader: BufReader<ZlibDecoder<File>>) -> Result<GitObject, anyhow::Error> {
+struct TreeEntry {
+    _mode: u64,
+    name: String,
+    _sha: Vec<u8>,
+}
+
+struct TreeObject {
+    _data_size: usize,
+    entries: Vec<TreeEntry>,
+}
+
+enum GitObject {
+    Blob(BlobObject),
+    Tree(TreeObject),
+}
+
+fn read_tree_entry(
+    reader: &mut BufReader<ZlibDecoder<File>>,
+) -> Result<(TreeEntry, usize), anyhow::Error> {
+    let mut buf = Vec::new();
+    let mut total = 0;
+
+    let n = reader.read_until(b' ', &mut buf)?;
+    total += n;
+
+    let mode = buf.strip_suffix(&[b' ']).unwrap();
+
+    let mode: u64 = std::str::from_utf8(mode)
+        .context("not utf8 ?")?
+        .parse()
+        .context("not a number ?")?;
+
+    buf.clear();
+    let n = reader.read_until(0, &mut buf)?;
+    total += n;
+    let name = buf.strip_suffix(&[0]).unwrap();
+
+    let mut sha = vec![0u8; 20];
+    reader.read_exact(&mut sha)?;
+    total += 20;
+
+    return Ok((
+        TreeEntry {
+            _mode: mode,
+            name: String::from_str(std::str::from_utf8(name)?)?,
+            _sha: sha,
+        },
+        total,
+    ));
+}
+
+// `<blob> <content-size>\0<content>`
+// `<tree> <content-size>\0<content>` where `<content>`
+//      `<mode> <name>\0<20 bytes sha>`
+fn read_git_object(reader: &mut BufReader<ZlibDecoder<File>>) -> Result<GitObject, anyhow::Error> {
     let mut buf = Vec::new();
 
     reader.read_until(b' ', &mut buf)?;
+    let object_type = buf.strip_suffix(&[b' ']).unwrap();
 
-    let object_type = if buf.starts_with(b"blob") {
+    let object_type = if object_type.starts_with(b"blob") {
         ObjectType::Blob
+    } else if object_type.starts_with(b"tree") {
+        ObjectType::Tree
     } else {
         let object_type = std::str::from_utf8(&buf).context("not utf8 ?")?;
-        let object_type = &object_type[0..object_type.len() - 1];
 
         return Err(anyhow!("Object type `{object_type}` is not supported"));
     };
 
     buf.clear();
     reader.read_until(0, &mut buf)?;
+    let size = buf.strip_suffix(&[0]).unwrap();
 
-    let size = std::str::from_utf8(&buf)
+    let size: usize = std::str::from_utf8(size)
         .context("not utf8 ?")?
-        .parse::<usize>()
+        .parse()
         .context("not a number ?")?;
 
-    buf.clear();
-    let n = reader.read_to_end(&mut buf)?;
+    match object_type {
+        ObjectType::Tree => {
+            let mut entries: Vec<TreeEntry> = Vec::new();
+            let mut remaining = size;
 
-    if size != n {
-        anyhow::bail!("Expected {size} bytes, got {n}");
-    }
+            while remaining > 0 {
+                let (entry, n) = read_tree_entry(reader)?;
+                entries.push(entry);
+                remaining -= n;
+            }
 
-    return Ok(GitObject {
-        object_type,
-        _size: size,
-        data: buf,
-    });
+            let object = GitObject::Tree(TreeObject {
+                _data_size: size,
+                entries,
+            });
+
+            return Ok(object);
+        }
+        ObjectType::Blob => {
+            buf.clear();
+            let n = reader.read_to_end(&mut buf)?;
+
+            anyhow::ensure!(n == size, "Expected {size} bytes, got {n} bytes");
+
+            let object = GitObject::Blob(BlobObject {
+                _data_size: size,
+                data: buf,
+            });
+
+            return Ok(object);
+        }
+    };
 }
 
 fn main() -> Result<(), anyhow::Error> {
@@ -109,15 +191,17 @@ fn main() -> Result<(), anyhow::Error> {
             match File::open(&path) {
                 Ok(file) => {
                     let decoder = ZlibDecoder::new(file);
-                    let reader = BufReader::new(decoder);
-                    let object = parse_git_object(reader)?;
+                    let mut reader = BufReader::new(decoder);
+                    let object = read_git_object(&mut reader)?;
 
-                    anyhow::ensure!(
-                        object.object_type == ObjectType::Blob,
-                        "cat-file can only read blob objects"
-                    );
-
-                    print!("{}", std::str::from_utf8(&object.data)?);
+                    match object {
+                        GitObject::Blob(blob) => {
+                            print!("{}", std::str::from_utf8(&blob.data)?);
+                        }
+                        _ => {
+                            anyhow::bail!("cat-file can only read blob objects");
+                        }
+                    }
                 }
                 Err(_) => {
                     anyhow::bail!("No such file or directory: {}", &path);
@@ -161,6 +245,38 @@ fn main() -> Result<(), anyhow::Error> {
                 anyhow::bail!("No such file or directory: {}", &filename);
             }
         },
+        Command::LsTree {
+            name_only,
+            object_hash,
+        } => {
+            anyhow::ensure!(name_only, "expected --name-only");
+
+            let dirname = &object_hash[0..2];
+            let filename = &object_hash[2..];
+            let path = std::format!(".git/objects/{dirname}/{filename}");
+
+            match File::open(&path) {
+                Ok(file) => {
+                    let decoder = ZlibDecoder::new(file);
+                    let mut reader = BufReader::new(decoder);
+                    let object = read_git_object(&mut reader)?;
+
+                    match object {
+                        GitObject::Tree(tree) => {
+                            for entry in tree.entries.into_iter() {
+                                println!("{}", entry.name);
+                            }
+                        }
+                        _ => {
+                            anyhow::bail!("ls-tree can only read tree objects");
+                        }
+                    }
+                }
+                Err(_) => {
+                    anyhow::bail!("No such file or directory: {}", &path);
+                }
+            }
+        }
     }
 
     return Ok(());
