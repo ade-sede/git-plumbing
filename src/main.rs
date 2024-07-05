@@ -1,8 +1,11 @@
 #[allow(unused_imports)]
 use std::env;
 use std::{
+    cmp::Ordering,
     fs::File,
     io::{BufRead, BufReader, Read, Write},
+    os::unix::fs::MetadataExt,
+    path::PathBuf,
     str::FromStr,
 };
 
@@ -38,6 +41,7 @@ enum Command {
         name_only: bool,
         object_hash: String,
     },
+    WriteTree,
 }
 
 #[allow(unused_imports)]
@@ -50,19 +54,103 @@ enum ObjectType {
 }
 
 struct BlobObject {
-    _data_size: usize,
+    #[allow(dead_code)]
+    data_size: usize,
     data: Vec<u8>,
 }
 
+impl BlobObject {
+    pub fn pack(self: &BlobObject) -> Vec<u8> {
+        return [
+            b"blob ",
+            self.data.len().to_string().as_bytes(),
+            b"\0",
+            self.data.as_slice(),
+        ]
+        .concat();
+    }
+}
+
+#[derive(Clone, Debug, Eq)]
 struct TreeEntry {
-    _mode: u64,
+    mode: u32,
     name: String,
-    _sha: Vec<u8>,
+    sha: String,
+}
+
+impl TreeEntry {
+    pub fn pack(self: &TreeEntry) -> Vec<u8> {
+        let sha = hex::decode(&self.sha).unwrap();
+
+        return [
+            self.mode.to_string().as_bytes(),
+            b" ",
+            self.name.to_string().as_bytes(),
+            b"\0",
+            sha.as_slice(),
+        ]
+        .concat();
+    }
+}
+
+// git is very particular about how it sorts entries in a tree
+// 1. case-sensitive (uppercase before lowercase)
+// 2. for the sake of comparison, directories are treated as if there were a trailing `/`
+impl PartialOrd for TreeEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TreeEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let self_name = if self.mode == 040000 {
+            format!("{}/", self.name)
+        } else {
+            self.name.clone()
+        };
+        let other_name = if other.mode == 040000 {
+            format!("{}/", other.name)
+        } else {
+            other.name.clone()
+        };
+
+        self_name.cmp(&other_name)
+    }
+}
+
+impl PartialEq for TreeEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.mode == other.mode
+    }
 }
 
 struct TreeObject {
-    _data_size: usize,
+    #[allow(dead_code)]
+    data_size: usize,
     entries: Vec<TreeEntry>,
+}
+
+impl TreeObject {
+    pub fn pack(self: &mut TreeObject) -> Vec<u8> {
+        self.entries.sort();
+
+        let packed = self
+            .entries
+            .as_slice()
+            .into_iter()
+            .map(|entry| entry.pack())
+            .collect::<Vec<Vec<u8>>>()
+            .concat();
+
+        return [
+            b"tree ",
+            packed.len().to_string().as_bytes(),
+            b"\0",
+            packed.as_slice(),
+        ]
+        .concat();
+    }
 }
 
 enum GitObject {
@@ -81,7 +169,7 @@ fn read_tree_entry(
 
     let mode = buf.strip_suffix(&[b' ']).unwrap();
 
-    let mode: u64 = std::str::from_utf8(mode)
+    let mode: u32 = std::str::from_utf8(mode)
         .context("not utf8 ?")?
         .parse()
         .context("not a number ?")?;
@@ -97,9 +185,9 @@ fn read_tree_entry(
 
     return Ok((
         TreeEntry {
-            _mode: mode,
+            mode,
             name: String::from_str(std::str::from_utf8(name)?)?,
-            _sha: sha,
+            sha: hex::encode(sha),
         },
         total,
     ));
@@ -145,7 +233,7 @@ fn read_git_object(reader: &mut BufReader<ZlibDecoder<File>>) -> Result<GitObjec
             }
 
             let object = GitObject::Tree(TreeObject {
-                _data_size: size,
+                data_size: size,
                 entries,
             });
 
@@ -158,13 +246,126 @@ fn read_git_object(reader: &mut BufReader<ZlibDecoder<File>>) -> Result<GitObjec
             anyhow::ensure!(n == size, "Expected {size} bytes, got {n} bytes");
 
             let object = GitObject::Blob(BlobObject {
-                _data_size: size,
+                data_size: size,
                 data: buf,
             });
 
             return Ok(object);
         }
     };
+}
+
+fn hash_object(filename: PathBuf, write_to_disk: bool) -> Result<String, anyhow::Error> {
+    match File::open(&filename) {
+        Ok(input_file) => {
+            let mut content = Vec::new();
+            let mut reader = BufReader::new(input_file);
+            reader.read_to_end(&mut content).unwrap();
+
+            let object = BlobObject {
+                data: content.clone(),
+                data_size: content.len(),
+            };
+
+            let packed_object = object.pack();
+
+            let mut hasher = Sha1::new();
+            hasher.write_all(&packed_object)?;
+
+            let object_sha = hasher.finalize();
+            let object_hash = hex::encode(object_sha);
+
+            let dirname = &object_hash[0..2];
+            let filename = &object_hash[2..];
+
+            if write_to_disk {
+                fs::create_dir(format!(".git/objects/{dirname}"))?;
+                let output_file = File::create(format!(".git/objects/{dirname}/{filename}"))?;
+                let mut encoder = ZlibEncoder::new(output_file, Compression::best());
+
+                encoder.write(&packed_object)?;
+            }
+
+            return Ok(object_hash);
+        }
+        Err(_) => {
+            anyhow::bail!("No such file or directory: {:?}", filename);
+        }
+    }
+}
+
+fn write_tree(path: PathBuf) -> Result<String, anyhow::Error> {
+    let directory = fs::read_dir(path)?;
+    let mut entries: Vec<TreeEntry> = Vec::new();
+
+    for entry in directory {
+        if let Ok(entry) = entry {
+            let file_name = String::from_str(entry.file_name().to_str().unwrap())?;
+            let file_type = entry.file_type()?;
+
+            let sha = if file_type.is_file() {
+                hash_object(entry.path(), true)?
+            } else if file_type.is_dir() {
+                if file_name == ".git" {
+                    continue;
+                }
+                write_tree(entry.path())?
+            } else {
+                anyhow::bail!("Neither file nor dir");
+            };
+
+            // Took this small snippet to compute mode from johnoo's implementation.
+            // I'm not entirely sure i understand git object mode.
+            // Seems like mode is a mix of
+            // - file type (first 3 digits)
+            // - unix permissions (last 3 digits)
+            //
+            // 040 -> dir
+            // 120 -> symlink
+            // 100 -> normal file
+            // 160 -> submodule (not covered here)
+            let mode = if file_type.is_dir() {
+                040000
+            } else if file_type.is_symlink() {
+                120000
+            } else if (entry.metadata()?.mode() & 0o111) != 0 {
+                // has at least one executable bit set
+                100755
+            } else {
+                100644
+            };
+
+            entries.push(TreeEntry {
+                mode,
+                name: file_name,
+                sha,
+            })
+        }
+    }
+
+    let mut tree = TreeObject {
+        data_size: 0, // unused
+        entries,
+    };
+
+    let packed_tree = tree.pack();
+
+    let mut hasher = Sha1::new();
+    hasher.write_all(&packed_tree)?;
+
+    let tree_sha = hasher.finalize();
+    let tree_hash = hex::encode(tree_sha);
+
+    let dirname = &tree_hash[0..2];
+    let filename = &tree_hash[2..];
+
+    fs::create_dir(format!(".git/objects/{dirname}"))?;
+    let output_file = File::create(format!(".git/objects/{dirname}/{filename}"))?;
+    let mut encoder = ZlibEncoder::new(output_file, Compression::best());
+
+    encoder.write(&packed_tree)?;
+
+    return Ok(tree_hash);
 }
 
 fn main() -> Result<(), anyhow::Error> {
@@ -208,43 +409,10 @@ fn main() -> Result<(), anyhow::Error> {
                 }
             }
         }
-        Command::HashObject { write, filename } => match File::open(&filename) {
-            Ok(input_file) => {
-                let mut content = Vec::new();
-                let mut reader = BufReader::new(input_file);
-                reader.read_to_end(&mut content).unwrap();
-
-                let object = [
-                    b"blob ",
-                    content.len().to_string().as_bytes(),
-                    b"\0",
-                    content.as_slice(),
-                ]
-                .concat();
-
-                let mut hasher = Sha1::new();
-                hasher.write_all(&object)?;
-
-                let sha = hasher.finalize();
-                let object_hash = hex::encode(sha);
-
-                let dirname = &object_hash[0..2];
-                let filename = &object_hash[2..];
-
-                if write {
-                    fs::create_dir(format!(".git/objects/{dirname}"))?;
-                    let output_file = File::create(format!(".git/objects/{dirname}/{filename}"))?;
-                    let mut encoder = ZlibEncoder::new(output_file, Compression::best());
-
-                    encoder.write(&object)?;
-                }
-
-                println!("{}", object_hash);
-            }
-            Err(_) => {
-                anyhow::bail!("No such file or directory: {}", &filename);
-            }
-        },
+        Command::HashObject { write, filename } => {
+            let hash = hash_object(PathBuf::from(filename), write)?;
+            print!("{hash}");
+        }
         Command::LsTree {
             name_only,
             object_hash,
@@ -276,6 +444,13 @@ fn main() -> Result<(), anyhow::Error> {
                     anyhow::bail!("No such file or directory: {}", &path);
                 }
             }
+        }
+        Command::WriteTree => {
+            // Assume that every file in the current directory needs to be convered to git objects.
+            // Usually, only files / directories in the staging area need to be converted to git
+            // objects.
+            let tree_hash = write_tree(PathBuf::from("."))?;
+            print!("{tree_hash}");
         }
     }
 
