@@ -7,6 +7,7 @@ use std::{
     os::unix::fs::MetadataExt,
     path::PathBuf,
     str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Context};
@@ -42,20 +43,28 @@ enum Command {
         object_hash: String,
     },
     WriteTree,
+    CommitTree {
+        #[clap(short = 'm')]
+        commit_message: String,
+
+        #[clap(short = 'p')]
+        parent_hash: String,
+
+        tree_hash: String,
+    },
 }
 
 #[allow(unused_imports)]
 use std::fs;
 
-#[derive(Eq, PartialEq)]
+#[derive(Eq, PartialEq, Debug)]
 enum ObjectType {
     Blob,
     Tree,
+    Commit,
 }
 
 struct BlobObject {
-    #[allow(dead_code)]
-    data_size: usize,
     data: Vec<u8>,
 }
 
@@ -126,8 +135,6 @@ impl PartialEq for TreeEntry {
 }
 
 struct TreeObject {
-    #[allow(dead_code)]
-    data_size: usize,
     entries: Vec<TreeEntry>,
 }
 
@@ -153,9 +160,86 @@ impl TreeObject {
     }
 }
 
+struct CommitObject {
+    tree_hash: String,
+    parents: Vec<String>,
+    author_name: String,
+    author_email: String,
+    author_date_seconds: SystemTime,
+    author_date_timezone: String,
+    committer_name: String,
+    committer_email: String,
+    committer_date_seconds: SystemTime,
+    committer_date_timezone: String,
+    commit_message: String,
+}
+
+impl CommitObject {
+    pub fn pack(self: &CommitObject) -> Result<Vec<u8>, anyhow::Error> {
+        let tree_hash = [b"tree ", self.tree_hash.as_bytes(), b"\n"].concat();
+        let parents = self
+            .parents
+            .as_slice()
+            .into_iter()
+            .map(|parent_hash| [b"parent ", parent_hash.as_bytes(), b"\n"].concat())
+            .collect::<Vec<Vec<u8>>>()
+            .concat();
+
+        let author = [
+            b"author ",
+            self.author_name.as_bytes(),
+            b" ",
+            self.author_email.as_bytes(),
+            b" ",
+            self.author_date_seconds
+                .duration_since(UNIX_EPOCH)?
+                .as_secs()
+                .to_string()
+                .as_bytes(),
+            b" ",
+            self.author_date_timezone.as_bytes(),
+            b"\n",
+        ]
+        .concat();
+
+        let committer = [
+            b"committer ",
+            self.committer_name.as_bytes(),
+            b" ",
+            self.committer_email.as_bytes(),
+            b" ",
+            self.committer_date_seconds
+                .duration_since(UNIX_EPOCH)?
+                .as_secs()
+                .to_string()
+                .as_bytes(),
+            b" ",
+            self.committer_date_timezone.as_bytes(),
+            b"\n",
+        ]
+        .concat();
+
+        let message = [b"\n", self.commit_message.as_bytes(), b"\n"].concat();
+
+        let content = [tree_hash, parents, author, committer, message].concat();
+
+        let packed = [
+            b"commit ",
+            content.len().to_string().as_bytes(),
+            b"\0",
+            content.as_slice(),
+        ]
+        .concat();
+
+        return Ok(packed);
+    }
+}
+
 enum GitObject {
     Blob(BlobObject),
     Tree(TreeObject),
+    #[allow(dead_code)]
+    Commit(CommitObject),
 }
 
 fn read_tree_entry(
@@ -206,6 +290,8 @@ fn read_git_object(reader: &mut BufReader<ZlibDecoder<File>>) -> Result<GitObjec
         ObjectType::Blob
     } else if object_type.starts_with(b"tree") {
         ObjectType::Tree
+    } else if object_type.starts_with(b"comit") {
+        ObjectType::Commit
     } else {
         let object_type = std::str::from_utf8(&buf).context("not utf8 ?")?;
 
@@ -232,10 +318,7 @@ fn read_git_object(reader: &mut BufReader<ZlibDecoder<File>>) -> Result<GitObjec
                 remaining -= n;
             }
 
-            let object = GitObject::Tree(TreeObject {
-                data_size: size,
-                entries,
-            });
+            let object = GitObject::Tree(TreeObject { entries });
 
             return Ok(object);
         }
@@ -245,12 +328,12 @@ fn read_git_object(reader: &mut BufReader<ZlibDecoder<File>>) -> Result<GitObjec
 
             anyhow::ensure!(n == size, "Expected {size} bytes, got {n} bytes");
 
-            let object = GitObject::Blob(BlobObject {
-                data_size: size,
-                data: buf,
-            });
+            let object = GitObject::Blob(BlobObject { data: buf });
 
             return Ok(object);
+        }
+        ObjectType::Commit => {
+            anyhow::bail!("Unimplemented read: commit");
         }
     };
 }
@@ -264,7 +347,6 @@ fn hash_object(filename: PathBuf, write_to_disk: bool) -> Result<String, anyhow:
 
             let object = BlobObject {
                 data: content.clone(),
-                data_size: content.len(),
             };
 
             let packed_object = object.pack();
@@ -343,10 +425,7 @@ fn write_tree(path: PathBuf) -> Result<String, anyhow::Error> {
         }
     }
 
-    let mut tree = TreeObject {
-        data_size: 0, // unused
-        entries,
-    };
+    let mut tree = TreeObject { entries };
 
     let packed_tree = tree.pack();
 
@@ -451,6 +530,44 @@ fn main() -> Result<(), anyhow::Error> {
             // objects.
             let tree_hash = write_tree(PathBuf::from("."))?;
             print!("{tree_hash}");
+        }
+        Command::CommitTree {
+            tree_hash,
+            parent_hash,
+            commit_message,
+        } => {
+            let commit = CommitObject {
+                tree_hash,
+                commit_message,
+                parents: vec![parent_hash],
+                author_date_seconds: SystemTime::now(),
+                author_date_timezone: "+0001".to_string(),
+                author_email: "bogus-mail@bogus-exchange.com".to_string(),
+                author_name: "A Koala".to_string(),
+                committer_date_seconds: SystemTime::now(),
+                committer_date_timezone: "+0001".to_string(),
+                committer_email: "bogus-mail@bogus-exchange.com".to_string(),
+                committer_name: "A Koala".to_string(),
+            };
+
+            let packed_commit = commit.pack()?;
+
+            let mut hasher = Sha1::new();
+            hasher.write_all(&packed_commit)?;
+
+            let commit_sha = hasher.finalize();
+            let commit_hash = hex::encode(commit_sha);
+
+            let dirname = &commit_hash[0..2];
+            let filename = &commit_hash[2..];
+
+            fs::create_dir(format!(".git/objects/{dirname}"))?;
+            let output_file = File::create(format!(".git/objects/{dirname}/{filename}"))?;
+            let mut encoder = ZlibEncoder::new(output_file, Compression::best());
+
+            encoder.write(&packed_commit)?;
+
+            print!("{commit_hash}");
         }
     }
 
