@@ -338,7 +338,7 @@ fn read_git_object(reader: &mut BufReader<ZlibDecoder<File>>) -> Result<GitObjec
     };
 }
 
-fn hash_object(filename: PathBuf, write_to_disk: bool) -> Result<String, anyhow::Error> {
+fn hash_object(filename: PathBuf) -> Result<String, anyhow::Error> {
     match File::open(&filename) {
         Ok(input_file) => {
             let mut content = Vec::new();
@@ -350,23 +350,7 @@ fn hash_object(filename: PathBuf, write_to_disk: bool) -> Result<String, anyhow:
             };
 
             let packed_object = object.pack();
-
-            let mut hasher = Sha1::new();
-            hasher.write_all(&packed_object)?;
-
-            let object_sha = hasher.finalize();
-            let object_hash = hex::encode(object_sha);
-
-            let dirname = &object_hash[0..2];
-            let filename = &object_hash[2..];
-
-            if write_to_disk {
-                fs::create_dir(format!(".git/objects/{dirname}"))?;
-                let output_file = File::create(format!(".git/objects/{dirname}/{filename}"))?;
-                let mut encoder = ZlibEncoder::new(output_file, Compression::best());
-
-                encoder.write(&packed_object)?;
-            }
+            let object_hash = write_object_file(packed_object)?;
 
             return Ok(object_hash);
         }
@@ -386,7 +370,7 @@ fn write_tree(path: PathBuf) -> Result<String, anyhow::Error> {
             let file_type = entry.file_type()?;
 
             let sha = if file_type.is_file() {
-                hash_object(entry.path(), true)?
+                hash_object(entry.path())?
             } else if file_type.is_dir() {
                 if file_name == ".git" {
                     continue;
@@ -426,23 +410,8 @@ fn write_tree(path: PathBuf) -> Result<String, anyhow::Error> {
     }
 
     let mut tree = TreeObject { entries };
-
     let packed_tree = tree.pack();
-
-    let mut hasher = Sha1::new();
-    hasher.write_all(&packed_tree)?;
-
-    let tree_sha = hasher.finalize();
-    let tree_hash = hex::encode(tree_sha);
-
-    let dirname = &tree_hash[0..2];
-    let filename = &tree_hash[2..];
-
-    fs::create_dir(format!(".git/objects/{dirname}"))?;
-    let output_file = File::create(format!(".git/objects/{dirname}/{filename}"))?;
-    let mut encoder = ZlibEncoder::new(output_file, Compression::best());
-
-    encoder.write(&packed_tree)?;
+    let tree_hash = write_object_file(packed_tree)?;
 
     return Ok(tree_hash);
 }
@@ -489,7 +458,9 @@ fn main() -> Result<(), anyhow::Error> {
             }
         }
         Command::HashObject { write, filename } => {
-            let hash = hash_object(PathBuf::from(filename), write)?;
+            anyhow::ensure!(write, "expected -w");
+
+            let hash = hash_object(PathBuf::from(filename))?;
             print!("{hash}");
         }
         Command::LsTree {
@@ -551,25 +522,30 @@ fn main() -> Result<(), anyhow::Error> {
             };
 
             let packed_commit = commit.pack()?;
-
-            let mut hasher = Sha1::new();
-            hasher.write_all(&packed_commit)?;
-
-            let commit_sha = hasher.finalize();
-            let commit_hash = hex::encode(commit_sha);
-
-            let dirname = &commit_hash[0..2];
-            let filename = &commit_hash[2..];
-
-            fs::create_dir(format!(".git/objects/{dirname}"))?;
-            let output_file = File::create(format!(".git/objects/{dirname}/{filename}"))?;
-            let mut encoder = ZlibEncoder::new(output_file, Compression::best());
-
-            encoder.write(&packed_commit)?;
+            let commit_hash = write_object_file(packed_commit)?;
 
             print!("{commit_hash}");
         }
     }
 
     return Ok(());
+}
+
+fn write_object_file(packed: Vec<u8>) -> Result<String, anyhow::Error> {
+    let mut hasher = Sha1::new();
+    hasher.write_all(&packed)?;
+
+    let sha = hasher.finalize();
+    let hash = hex::encode(sha);
+
+    let dirname = &hash[0..2];
+    let filename = &hash[2..];
+
+    fs::create_dir(format!(".git/objects/{dirname}"))?;
+    let output_file = File::create(format!(".git/objects/{dirname}/{filename}"))?;
+    let mut encoder = ZlibEncoder::new(output_file, Compression::best());
+
+    encoder.write(&packed)?;
+
+    return Ok(hash);
 }
