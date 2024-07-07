@@ -1,61 +1,27 @@
-[![progress-banner](https://backend.codecrafters.io/progress/git/aaa7b7b8-4687-4cdc-bf8e-56214e1c9bd1)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
-
-This is a starting point for Rust solutions to the
 ["Build Your Own Git" Challenge](https://codecrafters.io/challenges/git).
 
-In this challenge, you'll build a small Git implementation that's capable of
-initializing a repository, creating commits and cloning a public repository.
-Along the way we'll learn about the `.git` directory, Git objects (blobs,
-commits, trees etc.), Git's transfer protocols and more.
+Learn about git objects and [plumbing commands](https://git-scm.com/book/en/v2/Git-Internals-Plumbing-and-Porcelain).
 
-**Note**: If you're viewing this repo on GitHub, head over to
-[codecrafters.io](https://codecrafters.io) to try the challenge.
+```bash
+# Initialize a git directory
+$> git init
 
-# Passing the first stage
+# Read a blob object
+$> cargo run cat-file -p <blob_sha>
 
-The entry point for your Git implementation is in `src/main.rs`. Study and
-uncomment the relevant code, and push your changes to pass the first stage:
+# Create a blob object
+$> cargo run hash-object -w </path/to/file/in/repo
 
-```sh
-git add .
-git commit -m "pass 1st stage" # any msg
-git push origin master
+# Read a tree object
+$> cargo run ls-tree --name-only <tree_sha>
+
+# Write a tree object (corresponding to all files in current directly, recursively)
+$> cargo run write-tree
+
+# Create a commit object
+$> cargo run commit-tree <tree_sha> -p <commit_sha> -m <message>
 ```
 
-That's all!
+# TODO
 
-# Stage 2 & beyond
-
-Note: This section is for stages 2 and beyond.
-
-1. Ensure you have `cargo (1.54)` installed locally
-1. Run `./your_git.sh` to run your Git implementation, which is implemented in
-   `src/main.rs`. This command compiles your Rust project, so it might be slow
-   the first time you run it. Subsequent runs will be fast.
-1. Commit your changes and run `git push origin master` to submit your solution
-   to CodeCrafters. Test output will be streamed to your terminal.
-
-# Testing locally
-
-The `your_git.sh` script is expected to operate on the `.git` folder inside the
-current working directory. If you're running this inside the root of this
-repository, you might end up accidentally damaging your repository's `.git`
-folder.
-
-We suggest executing `your_git.sh` in a different folder when testing locally.
-For example:
-
-```sh
-mkdir -p /tmp/testing && cd /tmp/testing
-/path/to/your/repo/your_git.sh init
-```
-
-To make this easier to type out, you could add a
-[shell alias](https://shapeshed.com/unix-alias/):
-
-```sh
-alias mygit=/path/to/your/repo/your_git.sh
-
-mkdir -p /tmp/testing && cd /tmp/testing
-mygit init
-```
+- Git clone
